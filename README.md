@@ -58,6 +58,7 @@ nix run .#overpass-load-with-areas -- france-260920.osm.pbf /srv/overpass/db --p
 | `osm-gen/` | `osm-gen`, the test input generator and reference verifier (Rust) |
 | `corpus/cases.txt` | snapshot of `osm-gen list`, read by Nix |
 | `corpus/invalid.txt` | snapshot of `osm-gen invalid-list`, read by Nix |
+| `.github/workflows/checks.yml` | CI: the flake's checks on x86_64 and aarch64, in shards by disk use |
 
 ## Usage
 

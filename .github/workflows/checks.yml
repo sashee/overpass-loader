@@ -1,0 +1,84 @@
+# The flake's checks on x86_64 and aarch64: the importer's databases against
+# upstream's, the references against their inputs, the comparator on real
+# data. Nothing is cached between runs: every run builds upstream and every
+# reference from scratch.
+#
+# All checks together take about 35 GB of store, more than a runner has, so
+# each system's checks run in shards on separate runners. Checks that share
+# a real extract share its references, so they stay in one shard.
+name: checks
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: ${{ matrix.platform.system }} / ${{ matrix.shard }}
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { system: x86_64-linux, runner: ubuntu-24.04 }
+          - { system: aarch64-linux, runner: ubuntu-24.04-arm }
+        # About 16 GB of store for luxembourg, 8 for liechtenstein, 10 for
+        # rest; "List the shard's checks" assigns them.
+        shard: [luxembourg, liechtenstein, rest]
+    env:
+      SYSTEM: ${{ matrix.platform.system }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Runners guarantee only 14 GB free; the luxembourg shard needs about
+      # 20 with its toolchains. None of these are used here.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc \
+            /usr/lib/jvm /usr/share/swift /usr/local/share/powershell /opt/hostedtoolcache
+          df -h /
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          # The bounds the README gives for a 16 GB machine: compiling
+          # upstream takes up to 1 GB per compiler process.
+          extra_nix_config: |
+            max-jobs = 3
+            cores = 2
+
+      - name: Evaluate the flake
+        run: nix flake check --no-build
+
+      - name: List the shard's checks
+        run: |
+          # A check goes to the first shard whose pattern matches its name;
+          # rest takes everything else, so new checks run without changes here.
+          nix eval --raw ".#checks.$SYSTEM" --apply 'checks: builtins.concatStringsSep "\n" (builtins.attrNames checks)' \
+            | awk -v shard="$SHARD" '
+                { s = /luxembourg/ ? "luxembourg" : /liechtenstein|comparator|scripts/ ? "liechtenstein" : "rest" }
+                s == shard' > checks.txt
+          cat checks.txt
+          [ -s checks.txt ] || { echo "no checks in shard $SHARD"; exit 1; }
+
+      - name: Build the checks
+        run: |
+          mapfile -t installables < <(sed "s/^/.#checks.$SYSTEM./" checks.txt)
+          nix build --keep-going --no-link --print-build-logs "${installables[@]}"
+
+      - name: Disk usage
+        if: always()
+        run: df -h /
