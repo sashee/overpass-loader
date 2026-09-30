@@ -1,0 +1,8 @@
+[package]
+name = "overpass-cmp"
+version = "0.1.0"
+description = "Compares two Overpass API database directories, ignoring bytes Overpass never reads"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

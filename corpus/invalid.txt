@@ -1,0 +1,11 @@
+unsorted-nodes -	node ids not in increasing order
+duplicate-node -	the same node id twice
+unsorted-ways -	way ids not in increasing order
+ways-before-nodes -	element types not in the order nodes, ways, relations
+relations-before-ways -	element types not in the order nodes, ways, relations
+way-id-too-large -	a way id of 2^32, which Overpass cannot store
+relation-id-too-large -	a relation id above 2^32, which Overpass cannot store
+member-id-too-large -	a relation member referring to a way id of 2^32
+zero-id -	id 0, which OSM never assigns
+negative-ids -	negative ids, as editors use for objects not yet uploaded
+history history	a history file: several versions per element and deleted elements

@@ -1,0 +1,27 @@
+diff --git a/template_db/file_blocks.h b/template_db/file_blocks.h
+index b214b52f..5a527f41 100644
+--- a/template_db/file_blocks.h
++++ b/template_db/file_blocks.h
+@@ -995,16 +995,16 @@ void File_Blocks< TIndex, TIterator >::write_block(uint64* buf, uint32 payload_s
+   if (compression_method == File_Blocks_Index_Base::ZLIB_COMPRESSION)
+   {
+     payload = buffer.ptr;
+-    block_count = (
+-        Zlib_Deflate(1).compress(buf, payload_size, payload, block_size * compression_factor)
+-        - 1) / block_size + 1;
++    uint32 compressed_size = Zlib_Deflate(1).compress(buf, payload_size, payload, block_size * compression_factor);
++    block_count = (compressed_size - 1) / block_size + 1;
++    zero_padding((uint8*)payload + compressed_size, block_size * block_count - compressed_size);
+   }
+   else if (compression_method == File_Blocks_Index_Base::LZ4_COMPRESSION)
+   {
+     payload = buffer.ptr;
+-    block_count = (
+-        LZ4_Deflate().compress(buf, payload_size, payload, block_size * compression_factor * 2)
+-        - 1) / block_size + 1;
++    uint32 compressed_size = LZ4_Deflate().compress(buf, payload_size, payload, block_size * compression_factor * 2);
++    block_count = (compressed_size - 1) / block_size + 1;
++    zero_padding((uint8*)payload + compressed_size, block_size * block_count - compressed_size);
+   }
+ 
+   pos = allocate_block(block_count);

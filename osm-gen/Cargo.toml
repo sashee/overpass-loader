@@ -1,0 +1,9 @@
+[package]
+name = "osm-gen"
+version = "0.1.0"
+description = "Generates OSM test inputs for the Overpass importer and checks what the reference import made of them"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+overpass-cmp = { path = "../comparator" }
