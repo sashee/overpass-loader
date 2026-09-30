@@ -3,6 +3,8 @@ name = "overpass-import"
 version = "0.1.0"
 description = "Imports an OSM PBF file into a fresh Overpass API database, byte-equivalent to upstream update_database"
 edition = "2021"
+# slice::as_chunks
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
@@ -11,6 +13,10 @@ flate2 = "1"
 # Block compression must match upstream byte for byte: lz4-sys builds the C
 # liblz4 1.10.0, the version upstream links.
 lz4 = "1.28"
+# Raising the open-file limit, and removing temporary files on SIGTERM,
+# without unsafe code here.
+rlimit = "0.11"
+signal-hook = "0.4"
 
 # A workspace of its own, so that changing the importer does not change the
 # sources of the corpus tools and rebuild every reference database.

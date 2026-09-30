@@ -11,7 +11,7 @@
 //! background while the next pass runs. See FORMAT.md, "Files", for which
 //! files a phase writes.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -75,13 +75,21 @@ pub struct Context<'a> {
     pub settings: &'a Settings,
 }
 
+/// How temporary directories are named: this and the importer's process id.
+pub const TEMP_PREFIX: &str = ".overpass-import-";
+
+/// This process's directory for temporary files in `parent`.
+pub fn temp_dir_in(parent: &Path) -> PathBuf {
+    parent.join(format!("{TEMP_PREFIX}{}", std::process::id()))
+}
+
 /// A directory for temporary files, removed with everything in it when
 /// dropped.
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn create(parent: &Path) -> io::Result<TempDir> {
-        let path = parent.join(format!(".overpass-import-{}", std::process::id()));
+        let path = temp_dir_in(parent);
         fs::create_dir(&path).map_err(at(&path))?;
         Ok(TempDir(path))
     }
@@ -99,7 +107,16 @@ fn joined(
     handle.map_or(Ok(()), |h| h.join().expect("a file writer panicked"))
 }
 
-/// Imports `input` into the empty directory `db`.
+/// Flushes a file or directory to disk.
+fn sync(path: &Path) -> io::Result<()> {
+    File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(at(path))
+}
+
+/// Imports `input` into the empty directory `db`. The data version is
+/// written last, once every other file is on disk: a database without
+/// `osm_base_version` is incomplete.
 pub fn import(input: &Path, db: &Path, settings: &Settings) -> Result<(), ImportError> {
     let progress = Progress {
         enabled: settings.progress,
@@ -112,8 +129,32 @@ pub fn import(input: &Path, db: &Path, settings: &Settings) -> Result<(), Import
             iso8601(header.replication_timestamp.ok_or(PbfError::NoTimestamp)?)
         }
     };
+    write_files(input, db, settings, start, &progress)?;
+    let written = fs::read_dir(db)
+        .map_err(at(db))?
+        .map(|entry| entry.map(|e| e.path()).map_err(at(db)))
+        .collect::<io::Result<Vec<_>>>()?;
+    written
+        .iter()
+        .filter(|path| path.is_file())
+        .try_for_each(|path| sync(path))?;
     let version_file = db.join("osm_base_version");
     fs::write(&version_file, format!("{version}\n")).map_err(at(&version_file))?;
+    sync(&version_file)?;
+    sync(db)?;
+    progress.note(format_args!("flushed the files and wrote osm_base_version"));
+    Ok(())
+}
+
+/// Every file but `osm_base_version`, from the data after the header,
+/// which ends at byte `start`.
+fn write_files(
+    input: &Path,
+    db: &Path,
+    settings: &Settings,
+    start: u64,
+    progress: &Progress,
+) -> Result<(), ImportError> {
     let end = fs::metadata(input).map_err(at(input))?.len();
     let tmp = TempDir::create(settings.tmp_dir.as_deref().unwrap_or(db))?;
     let ctx = Context {
@@ -152,7 +193,6 @@ pub fn import(input: &Path, db: &Path, settings: &Settings) -> Result<(), Import
         compression: settings.compression,
         threads: settings.threads,
     };
-    let progress = &progress;
     let write = |files: ElementFiles, what: &'static str| {
         move || {
             files.write(out)?;

@@ -184,8 +184,9 @@ let
     '';
 
   # PBF encodings that must not change the database: node encoding, blob
-  # compression, metadata. osmconvert cannot read plain nodes or
-  # uncompressed blobs, so those go through osmium's XML instead.
+  # compression, metadata. Upstream and the importer read each. osmconvert
+  # cannot read plain nodes or uncompressed blobs, so for upstream those go
+  # through osmium's XML instead.
   encodings = {
     sparse-nodes = {
       options = ",pbf_dense_nodes=false";
@@ -212,29 +213,55 @@ let
     name:
     let
       e = byName.${name};
-      variant =
+      pbfs =
+        lib.mapAttrs (suffix: enc: toPbf "${name}-${suffix}" e.pbf enc.options) encodings
+        // lib.optionalAttrs (e.xmlWithoutMetadata != null) {
+          xml-without-metadata = toPbf "${name}-plain" e.xmlWithoutMetadata "";
+        };
+      readerOf = suffix: encodings.${suffix}.reader or "osmconvert";
+      upstream =
         suffix: reader: pbf:
         mkDb {
           inherit overpass pbf reader;
           inherit (e) areas;
           name = "${name}-${suffix}";
         };
-      variants =
-        lib.mapAttrs (suffix: enc: variant suffix enc.reader (toPbf "${name}-${suffix}" e.pbf enc.options)) encodings
-        // {
-          # The same PBF through a different XML writer.
-          osmium-reader = variant "osmium-reader" "osmium" e.pbf;
-        }
-        // lib.optionalAttrs (e.xmlWithoutMetadata != null) {
-          xml-without-metadata = variant "xml-without-metadata" "osmconvert" (toPbf "${name}-plain" e.xmlWithoutMetadata "");
-        };
+      upstreamDbs = lib.mapAttrs (suffix: upstream suffix (readerOf suffix)) pbfs // {
+        # The same PBF through a different XML writer.
+        osmium-reader = upstream "osmium-reader" "osmium" e.pbf;
+      };
+      # Encodings only the importer reads: for upstream they are the same XML.
+      importerPbfs = pbfs // {
+        # osmium's locations on ways, keeping the untagged nodes: ways also
+        # carry their nodes' positions (none for missing nodes).
+        locations-on-ways =
+          pkgs.runCommand "${name}-locations-on-ways.osm.pbf" { nativeBuildInputs = [ pkgs.osmium-tool ]; }
+            "osmium add-locations-to-ways --keep-untagged-nodes --ignore-missing-nodes ${e.pbf} -o $out";
+        osmconvert-writer =
+          pkgs.runCommand "${name}-osmconvert.osm.pbf" { nativeBuildInputs = [ pkgs.osmctools ]; }
+            "osmconvert ${e.pbf} --out-pbf -o=$out";
+      };
+      importedDb =
+        suffix: pbf:
+        let
+          db = imported {
+            name = "${name}-${suffix}";
+            inherit pbf;
+            compression = "lz4";
+          };
+        in
+        if e.areas then withAreas db else db;
     in
     check "encoding-${name}" (
       lib.concatStrings (
         lib.mapAttrsToList (suffix: db: ''
-          echo "== ${suffix}"
+          echo "== upstream, ${suffix}"
           overpass-cmp ${db} ${references.${name}.lz4}
-        '') variants
+        '') upstreamDbs
+        ++ lib.mapAttrsToList (suffix: pbf: ''
+          echo "== importer, ${suffix}"
+          overpass-cmp ${importedDb suffix pbf} ${references.${name}.lz4}
+        '') importerPbfs
       )
     );
 
@@ -421,6 +448,13 @@ let
       ''
     );
 
+  # PBF files no writer produces, crafted message by message: each must be
+  # refused, or give the same database as its plain encoding.
+  craftedCheck = pkgs.runCommand "import-crafted" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+    python3 ${./crafted-check.py} ${lib.getExe overpass-import}
+    touch $out
+  '';
+
   # Every input to refuse must be refused (exit 1), not imported, taken for
   # a usage error or crash.
   refusalCheck = pkgs.runCommand "import-refusals" { nativeBuildInputs = [ overpass-import ]; } ''
@@ -530,6 +564,7 @@ in
       invalid-list = invalidListCheck;
       invalid-inputs = invalidCheck;
       import-refusals = refusalCheck;
+      import-crafted = craftedCheck;
       scripts = scriptsCheck;
       serve-liechtenstein = serveCheck;
     }

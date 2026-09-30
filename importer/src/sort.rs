@@ -391,6 +391,8 @@ fn write_buffer(path: PathBuf, buffer: &mut Buffer) -> io::Result<Run> {
 /// when the reader is dropped.
 struct RunReader {
     file: File,
+    /// For errors; the file itself is already removed.
+    path: PathBuf,
     chunks: std::vec::IntoIter<Chunk>,
     data: Vec<u8>,
     /// Key start, key length, value length and end of the current record.
@@ -403,6 +405,7 @@ impl RunReader {
         fs::remove_file(&run.path).map_err(at(&run.path))?;
         let mut reader = RunReader {
             file,
+            path: run.path,
             chunks: run.chunks.into_iter(),
             data: Vec::new(),
             current: None,
@@ -418,7 +421,7 @@ impl RunReader {
         while pos >= self.data.len() {
             match self.chunks.next() {
                 Some(chunk) => {
-                    self.data = read_chunk(&self.file, chunk)?;
+                    self.data = read_chunk(&self.file, chunk).map_err(at(&self.path))?;
                     pos = 0;
                 }
                 None => {

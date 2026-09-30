@@ -1,0 +1,5 @@
+# cargo build in the dev shell (the importer has its own, in importer/)
+/target
+# nix build
+result
+result-*

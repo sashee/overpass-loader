@@ -39,6 +39,7 @@ pub enum PbfError {
     History,
     UnsupportedFeature(String),
     Resolution { nanodegrees: i64 },
+    CoordinateOverflow,
     StringIndex(u64),
     InvalidUtf8,
     StringTooLong(usize),
@@ -68,6 +69,9 @@ impl fmt::Display for PbfError {
             }
             PbfError::Resolution { nanodegrees } => {
                 write!(f, "coordinate {nanodegrees} nanodegrees is finer than the 1e-7 degrees Overpass stores")
+            }
+            PbfError::CoordinateOverflow => {
+                write!(f, "a coordinate exceeds the 64-bit range of nanodegrees")
             }
             PbfError::StringIndex(i) => write!(f, "string table index {i} out of range"),
             PbfError::InvalidUtf8 => write!(f, "a string is not valid UTF-8"),
@@ -281,7 +285,11 @@ struct Coordinates {
 impl Coordinates {
     /// A raw coordinate in 1e-7 degrees.
     fn coordinate(&self, offset: i64, raw: i64) -> Result<i64, PbfError> {
-        let nanodegrees = offset + self.granularity * raw;
+        let nanodegrees = self
+            .granularity
+            .checked_mul(raw)
+            .and_then(|n| n.checked_add(offset))
+            .ok_or(PbfError::CoordinateOverflow)?;
         if nanodegrees % 100 != 0 {
             return Err(PbfError::Resolution { nanodegrees });
         }
@@ -547,12 +555,12 @@ impl Builder {
 
 /// Decodes a primitive block.
 pub fn parse_block(block: &[u8]) -> Result<Block, PbfError> {
-    let mut strings = Vec::new();
+    let mut tables = Vec::new();
     let mut groups = Vec::new();
     let (mut granularity, mut lat_offset, mut lon_offset) = (100i64, 0i64, 0i64);
     for field in fields(block) {
         match field? {
-            (1, Value::Bytes(b)) => strings = string_table(b)?,
+            (1, Value::Bytes(b)) => tables.push(b),
             (2, Value::Bytes(b)) => groups.push(b),
             (17, Value::Varint(v)) => granularity = v as i64,
             (19, Value::Varint(v)) => lat_offset = v as i64,
@@ -560,6 +568,17 @@ pub fn parse_block(block: &[u8]) -> Result<Block, PbfError> {
             _ => {}
         }
     }
+    // Protobuf would merge repeated tables into one, and a reader could as
+    // well take the last; no writer repeats it, so refuse rather than guess.
+    let strings = match tables.as_slice() {
+        [] => Vec::new(),
+        [table] => string_table(table)?,
+        _ => {
+            return Err(PbfError::NotPbf(
+                "a block with several string tables".into(),
+            ))
+        }
+    };
     let mut builder = Builder {
         block: Block {
             strings,
@@ -688,6 +707,15 @@ pub mod tests {
     }
 
     #[test]
+    fn refuses_several_string_tables() {
+        let twice = [field(1, &field(1, b"")), dense_block()].concat();
+        assert_eq!(
+            parse_block(&twice).unwrap_err(),
+            PbfError::NotPbf("a block with several string tables".into())
+        );
+    }
+
+    #[test]
     fn reads_blobs_with_their_offsets() {
         let header = blob("OSMHeader", &header_block(&["OsmSchema-V0.6"]));
         let data = blob("OSMData", &dense_block());
@@ -800,5 +828,21 @@ pub mod tests {
             Err(PbfError::Resolution { nanodegrees: 150 })
         );
         assert_eq!(fine.lat(200), Ok(2));
+    }
+
+    #[test]
+    fn coordinates_beyond_64_bits_are_refused() {
+        let ctx = Coordinates {
+            granularity: 100,
+            lat_offset: 0,
+            lon_offset: 0,
+        };
+        // 100 * 2^62 would wrap to 0.
+        assert_eq!(ctx.lat(1 << 62), Err(PbfError::CoordinateOverflow));
+        let offset = Coordinates {
+            lat_offset: i64::MAX - 50,
+            ..ctx
+        };
+        assert_eq!(offset.lat(1), Err(PbfError::CoordinateOverflow));
     }
 }

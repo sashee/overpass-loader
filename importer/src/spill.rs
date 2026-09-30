@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::at;
 
@@ -20,6 +20,8 @@ pub struct Chunk {
 pub struct ChunkWriter {
     out: BufWriter<File>,
     offset: u64,
+    /// For errors: which file, and so which disk, failed.
+    path: PathBuf,
 }
 
 impl ChunkWriter {
@@ -28,12 +30,13 @@ impl ChunkWriter {
         Ok(ChunkWriter {
             out: BufWriter::with_capacity(1 << 20, file),
             offset: 0,
+            path: path.to_path_buf(),
         })
     }
 
     pub fn write(&mut self, raw: &[u8]) -> io::Result<Chunk> {
-        let data = lz4::block::compress(raw, None, false)?;
-        self.out.write_all(&data)?;
+        let data = lz4::block::compress(raw, None, false).map_err(at(&self.path))?;
+        self.out.write_all(&data).map_err(at(&self.path))?;
         let chunk = Chunk {
             offset: self.offset,
             stored: data.len() as u32,
@@ -44,7 +47,7 @@ impl ChunkWriter {
     }
 
     pub fn finish(mut self) -> io::Result<()> {
-        self.out.flush()
+        self.out.flush().map_err(at(&self.path))
     }
 }
 

@@ -12,6 +12,14 @@ let
     fetchurl {
       urls = [ "https://download.geofabrik.de/${path}-260101.osm.pbf" ];
       inherit hash;
+      # Geofabrik has outages of some minutes (HTTP 502): retry for up to 15
+      # minutes, not fetchurl's 3 quick retries. A missing file waits as long.
+      curlOptsList = [
+        "--retry"
+        "15"
+        "--retry-delay"
+        "60"
+      ];
     };
 in
 {

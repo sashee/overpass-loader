@@ -44,13 +44,16 @@ jobs:
       - uses: actions/checkout@v7
 
       # Runners guarantee only 14 GB free; the luxembourg shard needs about
-      # 20 with its toolchains. None of these are used here.
+      # 20 with its toolchains. Most have far more, so this removes the
+      # preinstalled toolchains, none of which are used here, only when needed.
       - name: Free disk space
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc \
-            /usr/lib/jvm /usr/share/swift /usr/local/share/powershell /opt/hostedtoolcache
-          df -h /
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc \
+              /usr/lib/jvm /usr/share/swift /usr/local/share/powershell /opt/hostedtoolcache
+            df -h /
+          fi
 
       - uses: cachix/install-nix-action@v31
         with:

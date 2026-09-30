@@ -89,6 +89,7 @@ impl Partitions {
         fs::remove_file(&self.path).map_err(at(&self.path))?;
         Ok(Partitioned {
             file,
+            path: self.path.clone(),
             chunks,
             tails: std::mem::take(&mut self.buffers),
         })
@@ -98,6 +99,8 @@ impl Partitions {
 /// Partitions ready to read, each once.
 pub struct Partitioned {
     file: File,
+    /// For errors; the file itself is already removed.
+    path: PathBuf,
     chunks: Vec<Vec<Chunk>>,
     tails: Vec<Vec<u8>>,
 }
@@ -112,10 +115,10 @@ impl Partitioned {
     pub fn read(&mut self, p: usize) -> impl Iterator<Item = io::Result<Vec<u8>>> + '_ {
         let chunks = std::mem::take(&mut self.chunks[p]);
         let tail = std::mem::take(&mut self.tails[p]);
-        let file = &self.file;
+        let (file, path) = (&self.file, &self.path);
         chunks
             .into_iter()
-            .map(move |c| read_chunk(file, c))
+            .map(move |c| read_chunk(file, c).map_err(at(path)))
             .chain((!tail.is_empty()).then_some(Ok(tail)))
     }
 }

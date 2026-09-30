@@ -232,10 +232,12 @@ impl BlockSink {
         Ok(BlockSink(Sink::spawn(
             move |batches: Receiver<Vec<Block>>| {
                 let mut file = BlockFile::new(out, b, compression, threads);
-                for blocks in batches {
-                    file.append(&blocks)?;
-                }
-                let (_, index) = file.finish()?;
+                let index = batches
+                    .into_iter()
+                    .try_for_each(|blocks| file.append(&blocks))
+                    .and_then(|()| file.finish())
+                    .map_err(at(&dir.join(&name)))?
+                    .1;
                 write_index(&dir, &name, &index)
             },
         )?))
@@ -276,10 +278,12 @@ impl MapSink {
         Ok(MapSink {
             sink: Sink::spawn(move |batches: Receiver<Vec<MapBlock>>| {
                 let mut file = MapFile::new(out, compression, threads);
-                for blocks in batches {
-                    file.append(&blocks)?;
-                }
-                let (_, index) = file.finish()?;
+                let index = batches
+                    .into_iter()
+                    .try_for_each(|blocks| file.append(&blocks))
+                    .and_then(|()| file.finish())
+                    .map_err(at(&dir.join(&name)))?
+                    .1;
                 write_index(&dir, &name, &index)
             })?,
             block: None,

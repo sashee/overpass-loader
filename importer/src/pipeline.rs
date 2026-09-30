@@ -14,12 +14,23 @@ use crate::elements::Block;
 use crate::error::{at, ImportError};
 use crate::pbf::{self, Blobs, Header, PbfError};
 
+/// Names the input in errors reading it.
+fn reading(input: &Path) -> impl Fn(ImportError) -> ImportError + '_ {
+    move |e| match e {
+        ImportError::Io(e) => ImportError::Io(at(input)(e)),
+        e => e,
+    }
+}
+
 /// Checks the `OSMHeader` blob at the start of `input`; where the data
 /// starts, and the header.
 pub fn read_header(input: &Path) -> Result<(u64, Header), ImportError> {
     let file = File::open(input).map_err(at(input))?;
     let mut blobs = Blobs::new(BufReader::new(file), 0);
-    let blob = blobs.next_blob()?.ok_or(PbfError::MissingHeader)?;
+    let blob = blobs
+        .next_blob()
+        .map_err(reading(input))?
+        .ok_or(PbfError::MissingHeader)?;
     if blob.kind != "OSMHeader" {
         return Err(PbfError::MissingHeader.into());
     }
@@ -110,13 +121,13 @@ pub fn for_each_block<T: Send>(
     mut consume: impl FnMut(Place, T) -> Result<(), ImportError>,
 ) -> Result<(), ImportError> {
     let mut file = File::open(input).map_err(at(input))?;
-    file.seek(SeekFrom::Start(range.0))?;
+    file.seek(SeekFrom::Start(range.0)).map_err(at(input))?;
     let reader = BufReader::with_capacity(4 << 20, file.take(range.1 - range.0));
     ordered(
         threads,
         move |push| {
             let mut blobs = Blobs::new(reader, range.0);
-            while let Some(blob) = blobs.next_blob()? {
+            while let Some(blob) = blobs.next_blob().map_err(reading(input))? {
                 match blob.kind.as_str() {
                     "OSMData" => push(blob)?,
                     "OSMHeader" => {

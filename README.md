@@ -26,8 +26,10 @@ nix run .#overpass-load-with-areas -- france-260920.osm.pbf /srv/overpass/db --p
 - The production settings are the defaults: lz4 for block and map files,
   and the data version (`osm_base_version`, the timestamp the server
   reports) from the PBF header's replication timestamp; a PBF without one
-  is refused unless `--version=TEXT` is given. Other options go to
-  `overpass-import` (`--memory`, `--threads`, `--tmp-dir`, `--progress`).
+  is refused unless `--version=TEXT` is given (`osmium extract`, `sort` and
+  `merge` drop the timestamp; `osmium cat` of one file keeps it). Other
+  options go to `overpass-import` (`--memory`, `--threads`, `--tmp-dir`,
+  `--progress`).
 - The areas come from `osm3s_query --rules` of the `overpass` package,
   without a dispatcher. `overpass-areas` fails if no areas result or if a
   dispatcher's files are present before or left behind after. Keeping it
@@ -50,6 +52,7 @@ nix run .#overpass-load-with-areas -- france-260920.osm.pbf /srv/overpass/db --p
 | `nix/checks.nix` | checks that the comparator is trustworthy on real databases |
 | `nix/corpus.nix` | the test corpus: inputs, reference databases, checks |
 | `nix/query-check.py` | queries a reference and compares every element with the input |
+| `nix/crafted-check.py` | crafts PBF files message by message and checks what the importer does with each |
 | `nix/serve-check.py` | serves a database and the reference over HTTP and compares their answers |
 | `nix/fuzz.nix` | `osm-fuzz`: random seeds beyond the corpus through the reference checks |
 | `FORMAT.md` | the database format and write rules of a fresh import, from upstream's code |
@@ -122,10 +125,11 @@ the following blocks, which carry the same key.
 | `invalid-inputs` | every input an importer must refuse is produced; upstream's behaviour on each is printed |
 | `import-<input>` | the importer's lz4 and uncompressed databases are equivalent to the references (for inputs with areas, after running upstream's areas pass on the importer's output), and with 64 KiB of memory it writes the same lz4 database |
 | `import-refusals` | the importer refuses (exit 1) every input it must refuse |
+| `import-crafted` | on PBF files no writer produces (other blob compressions, headers missing or repeated, granularity and offsets, mixed or empty groups, plain nodes, locations on ways, ids and order across blocks), the importer refuses what it must and otherwise writes the same database as for the plain encoding |
 | `scripts` | `overpass-load-with-areas` on Liechtenstein equals the reference with areas; the data version is the header's timestamp; the scripts refuse a non-empty directory, a missing database and missing arguments |
 | `serve-liechtenstein` | end to end: what `overpass-load-with-areas` writes for Liechtenstein, served as in production (lighttpd running `cgi-bin/interpreter`, dispatchers for the base data and the areas), answers queries over HTTP (bounding boxes, tags, recursion, areas) as the reference served the same way does, and reports the header's timestamp for the base data and the areas |
 | `corpus-<input>` | the input's references show what the input is meant to exercise (below) |
-| `encoding-<input>` | other PBF encodings of the same data give an equivalent database |
+| `encoding-<input>` | other PBF encodings of the same data give an equivalent database, through upstream and through the importer; the importer also reads osmium's locations on ways and PBF as osmconvert writes it |
 
 Nix runs builds with address space randomisation disabled (personality
 `ADDR_NO_RANDOMIZE`), so inside Nix two upstream builds usually come out
@@ -230,7 +234,8 @@ phase alone, over 200 bytes per node, so its reference needs a machine with
 
 ```sh
 overpass-import --db-dir=DIR [--compression-method=no|lz4]
-                [--map-compression-method=no|lz4] [--version=TEXT]
+                [--map-compression-method=no|lz4]
+                [--version=TEXT | --version-from-header]
                 [--memory=SIZE] [--threads=N] [--tmp-dir=DIR] [--progress]
                 FILE.osm.pbf
 ```
@@ -239,9 +244,25 @@ Defaults match `update_database`: lz4 for block files, no compression for
 map files. `DIR` must exist and be empty. Exit status 1 means the input was
 refused: history files, ids out of order or repeated, ids Overpass cannot
 store, positions finer than 1e-7 degrees, blobs compressed with anything but
-zlib, and damaged files. The areas are not its business: run upstream's
-`osm3s_query --rules < rules/areas.osm3s` on the result, as with a database
-from `update_database`.
+zlib, and damaged files. Exit status 2 is any other error; I/O errors name
+the file that failed, so a full disk says which one. The areas are not its
+business: run upstream's `osm3s_query --rules < rules/areas.osm3s` on the
+result, as with a database from `update_database`.
+
+`osm_base_version` is written last, after every other file is flushed to
+disk: a directory without it holds an incomplete database, from an import
+that failed or was interrupted, and a new import into it is refused until
+it is emptied. On SIGINT, SIGTERM or SIGHUP the importer removes its
+temporary files; after SIGKILL (or the kernel's out-of-memory killer) they
+stay, and the next import with the same `--tmp-dir` warns about them.
+
+The sorts keep many temporary files open at once, beyond the usual soft
+limit of 1024: the importer raises its soft limit to the hard limit, and
+warns if that is below 8192.
+
+A PBF with locations on ways (`osmium add-locations-to-ways`) imports
+like any other, but without `--keep-untagged-nodes` it lacks the untagged
+nodes, and their ways lose their geometry, as with upstream.
 
 - `--memory` (default `2G`): about how much the sorts, lookups and buffers
   may hold; the rest spills to temporary files. Decoding and writing take a

@@ -119,7 +119,9 @@ def dispatchers(db_dir):
 def run_query(query):
     body = urllib.parse.urlencode({"data": f"[out:json];{query}"}).encode()
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/api/interpreter", body, timeout=600) as response:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/api/interpreter", body, timeout=600
+        ) as response:
             return json.load(response)
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code} for {query}\n{e.read().decode(errors='replace')[-2000:]}")
