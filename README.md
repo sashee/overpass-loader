@@ -50,6 +50,7 @@ nix run .#overpass-load-with-areas -- france-260920.osm.pbf /srv/overpass/db --p
 | `nix/checks.nix` | checks that the comparator is trustworthy on real databases |
 | `nix/corpus.nix` | the test corpus: inputs, reference databases, checks |
 | `nix/query-check.py` | queries a reference and compares every element with the input |
+| `nix/serve-check.py` | serves a database and the reference over HTTP and compares their answers |
 | `nix/fuzz.nix` | `osm-fuzz`: random seeds beyond the corpus through the reference checks |
 | `FORMAT.md` | the database format and write rules of a fresh import, from upstream's code |
 | `importer/` | `overpass-import`, the new importer (Rust, its own Cargo workspace) |
@@ -122,6 +123,7 @@ the following blocks, which carry the same key.
 | `import-<input>` | the importer's lz4 and uncompressed databases are equivalent to the references (for inputs with areas, after running upstream's areas pass on the importer's output), and with 64 KiB of memory it writes the same lz4 database |
 | `import-refusals` | the importer refuses (exit 1) every input it must refuse |
 | `scripts` | `overpass-load-with-areas` on Liechtenstein equals the reference with areas; the data version is the header's timestamp; the scripts refuse a non-empty directory, a missing database and missing arguments |
+| `serve-liechtenstein` | end to end: what `overpass-load-with-areas` writes for Liechtenstein, served as in production (lighttpd running `cgi-bin/interpreter`, dispatchers for the base data and the areas), answers queries over HTTP (bounding boxes, tags, recursion, areas) as the reference served the same way does, and reports the header's timestamp for the base data and the areas |
 | `corpus-<input>` | the input's references show what the input is meant to exercise (below) |
 | `encoding-<input>` | other PBF encodings of the same data give an equivalent database |
 

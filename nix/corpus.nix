@@ -484,6 +484,33 @@ let
         touch $out
       '';
 
+  # End to end: the database the serving scripts write, served as production
+  # serves it (a web server running cgi-bin/interpreter, dispatchers for the
+  # base data and the areas), answers queries over HTTP as the reference
+  # does, served the same way, and reports the PBF header's timestamp.
+  serveCheck =
+    let
+      pbf = real.liechtenstein;
+      loaded = pkgs.runCommand "liechtenstein-loaded" { nativeBuildInputs = [ overpass-load-with-areas ]; } ''
+        overpass-load-with-areas ${pbf} $out --threads=2
+      '';
+    in
+    pkgs.runCommand "serve-liechtenstein"
+      {
+        nativeBuildInputs = [
+          overpass
+          pkgs.lighttpd
+          pkgs.osmium-tool
+          pkgs.python3
+        ];
+      }
+      ''
+        set -euo pipefail
+        version=$(osmium fileinfo -g header.option.osmosis_replication_timestamp ${pbf})
+        python3 ${./serve-check.py} ${overpass}/cgi-bin "$version" ${loaded} ${references.real-liechtenstein.lz4}
+        touch $out
+      '';
+
   listCheck = pkgs.runCommand "corpus-list" { nativeBuildInputs = [ osm-gen ]; } ''
     osm-gen list > actual
     diff -u ${../corpus/cases.txt} actual || {
@@ -504,6 +531,7 @@ in
       invalid-inputs = invalidCheck;
       import-refusals = refusalCheck;
       scripts = scriptsCheck;
+      serve-liechtenstein = serveCheck;
     }
     // lib.listToAttrs (map (e: lib.nameValuePair "import-${e.name}" (importCheck e)) entries)
     // lib.listToAttrs (map (e: lib.nameValuePair "corpus-${e.name}" (checkEntry e)) entries)
