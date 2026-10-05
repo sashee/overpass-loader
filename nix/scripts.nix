@@ -103,6 +103,11 @@ rec {
       for f in osm3s_osm_base osm3s_areas; do
         [ ! -e "$dir/$f" ] || fail "$dir/$f exists: is a dispatcher running on this database?"
       done
+      # The shard directories below hold symlinks back to this one, and a
+      # relative target would be resolved from inside the shard directory
+      # rather than from here -- every link dangling, which surfaces as the
+      # area pass reporting a database file that plainly exists as missing.
+      dir=$(realpath "$dir")
 
       if [ "$shards" -eq 1 ]; then
         # Without a dispatcher: --db-dir writes to the database directly. The
