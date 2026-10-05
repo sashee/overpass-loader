@@ -17,6 +17,8 @@ pub enum ImportError {
         error: BlockError,
     },
     Map(IdTooLarge),
+    /// Merging the area files of sharded builds; see areas.rs.
+    Areas(crate::areas::AreaError),
     Io(io::Error),
     /// A part of the import stopped because another failed; that one's
     /// error is reported instead.
@@ -36,6 +38,7 @@ impl fmt::Display for ImportError {
             ImportError::Input(e) => write!(f, "{e}"),
             ImportError::Block { file, error } => write!(f, "{file}: {error}"),
             ImportError::Map(e) => write!(f, "{e}"),
+            ImportError::Areas(e) => write!(f, "{e}"),
             ImportError::Io(e) => write!(f, "{e}"),
             ImportError::Cancelled => write!(f, "cancelled"),
         }

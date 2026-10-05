@@ -1,0 +1,96 @@
+diff --git a/overpass_api/statements/foreach.cc b/overpass_api/statements/foreach.cc
+--- a/overpass_api/statements/foreach.cc
++++ b/overpass_api/statements/foreach.cc
+@@ -79,16 +79,65 @@
+ { target.deriveds[idx].push_back(skel); }
+ 
+ 
++// Shard selection for running one foreach as several processes.
++//
++// $OVERPASS_FOREACH_SHARD="i/n" makes this process execute only every n-th
++// iteration of every foreach, starting at i. The iterations of a foreach are
++// independent of each other -- each one gets its own Set and the
++// substatements see nothing of the previous pass -- so the n shards together
++// perform exactly the iterations one unsharded run would, each exactly once.
++//
++// Taken from the environment rather than added as a statement attribute so
++// that every shard runs a byte-identical query: the input that decides which
++// iterations exist must not vary between them.
++static void foreach_shard(unsigned long long& index, unsigned long long& count)
++{
++  static unsigned long long i = 0;
++  static unsigned long long n = 1;
++  static bool parsed = false;
++  if (!parsed)
++  {
++    parsed = true;
++    const char* spec = getenv("OVERPASS_FOREACH_SHARD");
++    if (spec && *spec)
++    {
++      unsigned long long a = 0;
++      unsigned long long b = 0;
++      if (sscanf(spec, "%llu/%llu", &a, &b) != 2 || b == 0 || a >= b)
++      {
++        std::cerr<<"OVERPASS_FOREACH_SHARD must be \"i/n\" with n > 0 and 0 <= i < n, not \""
++            <<spec<<"\"\n";
++        exit(1);
++      }
++      i = a;
++      n = b;
++    }
++  }
++  index = i;
++  count = n;
++}
++
++
+ template< typename Index, typename Object >
+ void loop_over_elements(const std::map< Index, std::vector< Object > >& source, Resource_Manager& rman,
+-    std::vector< Statement* >& substatements, const std::string& input, const std::string& result_name)
++    std::vector< Statement* >& substatements, const std::string& input, const std::string& result_name,
++    unsigned long long& seq)
+ {
++  unsigned long long shard = 0;
++  unsigned long long shards = 1;
++  foreach_shard(shard, shards);
++
+   for (typename std::map< Index, std::vector< Object > >::const_iterator
+       it = source.begin(); it != source.end(); ++it)
+   {
+     for (typename std::vector< Object >::const_iterator it2 = it->second.begin();
+         it2 != it->second.end(); ++it2)
+     {
++      // Counted for every iteration, taken by this shard or not: the
++      // numbering has to mean the same thing in every process.
++      if (seq++ % shards != shard)
++        continue;
++
+       rman.count_loop();
+       Set empty;
+       add_to_set(empty, it->first, *it2);
+@@ -113,14 +162,17 @@
+   if (!base_set)
+     base_set = &base_result_set;
+ 
+-  loop_over_elements(base_set->nodes, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->attic_nodes, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->ways, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->attic_ways, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->relations, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->attic_relations, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->areas, rman, substatements, input, get_result_name());
+-  loop_over_elements(base_set->deriveds, rman, substatements, input, get_result_name());
++  // One sequence across every element type, so a shard's share is defined by
++  // position in the whole foreach rather than within one type.
++  unsigned long long seq = 0;
++  loop_over_elements(base_set->nodes, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->attic_nodes, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->ways, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->attic_ways, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->relations, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->attic_relations, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->areas, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->deriveds, rman, substatements, input, get_result_name(), seq);
+ 
+   rman.move_all_inward_except(get_result_name());
+   rman.pop_stack_frame();

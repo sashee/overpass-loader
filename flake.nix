@@ -31,6 +31,19 @@
         in
         {
           inherit overpass overpass-import;
+          # Upstream plus $OVERPASS_FOREACH_SHARD, which lets one foreach run
+          # as several processes. The areas pass is a foreach over about two
+          # million relations on one core -- two thirds of a planet build --
+          # and its iterations are independent, so this is the whole of what
+          # makes them parallel.
+          #
+          # A separate package rather than a patch on `overpass`: the server
+          # must keep running stock upstream, and nothing but the area build
+          # has any use for this.
+          overpass-sharded = overpass.override {
+            patches = [ ./nix/patches/foreach-shard.patch ];
+            variant = "sharded";
+          };
           # Upstream plus the fix that zeroes block padding, which makes
           # builds byte-reproducible; for the comparator's checks only.
           overpass-patched = overpass.override {
@@ -94,6 +107,17 @@
           inputs = realFor pkgs;
         }
         // (corpusFor pkgs).checks
+        // {
+          foreach-shard = pkgs.callPackage ./nix/shard-check.nix {
+            inherit (packagesFor pkgs) overpass overpass-sharded overpass-import;
+            # Base data only: the check runs the areas pass itself, both ways.
+            base = (mkDbFor pkgs) {
+              name = "liechtenstein";
+              pbf = (realFor pkgs).liechtenstein;
+              overpass = (packagesFor pkgs).overpass;
+            };
+          };
+        }
       );
 
       apps = forAllSystems (pkgs: {

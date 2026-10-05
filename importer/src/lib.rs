@@ -2,6 +2,7 @@
 //! equivalent to what upstream `update_database --flush-size=0` writes. The
 //! format is described in FORMAT.md.
 
+pub mod areas;
 pub mod blocks;
 pub mod compress;
 pub mod database;

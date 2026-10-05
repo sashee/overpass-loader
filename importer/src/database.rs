@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn empty_input_writes_only_the_version() {
         assert_eq!(
-            files("empty", &[]),
+            files("empty-input", &[]),
             vec![("osm_base_version".to_string(), 3)]
         );
     }

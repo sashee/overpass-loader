@@ -736,7 +736,24 @@ pub mod tests {
     use super::*;
 
     /// A fresh scratch directory for a test.
+    ///
+    /// The name is what makes it the test's own, so two tests must not share
+    /// one. Tests run as threads of a single process, so a shared name is a
+    /// shared directory, and whichever test finishes first removes it under
+    /// the other -- an error that depends on scheduling and so appears only
+    /// sometimes. `empty` was once used by both a sort test and a database
+    /// test and did exactly that. Refusing a reused name turns that into a
+    /// failure that says what is wrong.
     pub fn scratch(name: &str) -> PathBuf {
+        static USED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        assert!(
+            USED.lock()
+                .expect("a test panicked")
+                .insert(name.to_string()),
+            "two tests ask for the scratch directory {name:?}; names must be unique"
+        );
+
         let dir = std::env::temp_dir().join(format!(
             "overpass-import-test-{}-{name}",
             std::process::id()
