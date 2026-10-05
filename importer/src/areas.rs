@@ -22,13 +22,13 @@
 //! planet.
 
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::blocks::{pack, Group};
+use crate::blocks::Packer;
 use crate::compress::Compression;
 use crate::error::{at, ImportError};
-use crate::writer::BlockFile;
+use crate::writer::BlockSink;
 
 /// How long the key at the start of `data` is, matching the C++ `size_of`
 /// of the index type the file is keyed by.
@@ -169,6 +169,11 @@ impl Key {
 struct AreaFile {
     name: &'static str,
     key: Key,
+    /// Whether an area has at most one object in this file, so that two
+    /// objects with the same id mean the shards overlapped. `areas.bin`
+    /// holds one skeleton per area; the others hold several blocks or
+    /// several tags for one area, where repeats are expected.
+    one_object_per_area: bool,
     /// Length of the object starting at `data`, or `None` if its header is
     /// cut off.
     object_len: fn(&[u8]) -> Option<usize>,
@@ -198,20 +203,24 @@ const FILES: [AreaFile; 4] = [
     AreaFile {
         name: "areas.bin",
         key: Key::Uint31,
+        one_object_per_area: true,
         object_len: area_skeleton_len,
     },
     AreaFile {
         name: "area_blocks.bin",
+        one_object_per_area: false,
         key: Key::Uint31,
         object_len: area_block_len,
     },
     AreaFile {
         name: "area_tags_local.bin",
+        one_object_per_area: false,
         key: Key::TagLocal,
         object_len: area_id_len,
     },
     AreaFile {
         name: "area_tags_global.bin",
+        one_object_per_area: false,
         key: Key::TagGlobal,
         object_len: area_id_len,
     },
@@ -221,8 +230,18 @@ const FILES: [AreaFile; 4] = [
 /// key it is filed under.
 type Entry = (u64, u64, Vec<u8>);
 
-/// A group's objects as each shard holds them, before they are merged.
-type Parts = Vec<Vec<Vec<u8>>>;
+/// One index group as read: its key, and its objects as the single buffer
+/// they were stored in.
+///
+/// Deliberately not `blocks::Group`, which owns a `Vec` per object. The
+/// area tag files hold one four-byte id per object -- planet has about 1.2
+/// billion of them -- and a `Vec` each would cost tens of GB in headers and
+/// allocations alone. Here the bytes stay as they were read and objects are
+/// referred to by offset.
+struct RawGroup {
+    key: Vec<u8>,
+    objects: Vec<u8>,
+}
 
 /// What a file's index header says about how it was written, so the merged
 /// file is written the same way rather than to hardcoded settings.
@@ -352,18 +371,17 @@ fn block_payload(stored: &[u8], layout: Layout, path: &Path) -> Result<Vec<u8>, 
 
 /// Splits a group's payload into the objects it holds.
 ///
+/// Where each object in a group's payload starts.
+///
 /// The objects must use the payload up exactly. That is the structural
 /// check that notices upstream changing a record: a field added to
 /// `Area_Block` makes `object_len` read the wrong count, the walk loses
 /// step within a few records, and the bytes stop adding up.
-fn split_objects(
-    file: &AreaFile,
-    objects: &[u8],
-    path: &Path,
-) -> Result<Vec<Vec<u8>>, ImportError> {
+fn split_objects(file: &AreaFile, objects: &[u8], path: &Path) -> Result<Vec<usize>, ImportError> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < objects.len() {
+        out.push(at);
         let len = (file.object_len)(&objects[at..])
             .filter(|&len| len > 0 && at + len <= objects.len())
             .ok_or_else(|| {
@@ -376,14 +394,16 @@ fn split_objects(
                     ),
                 )
             })?;
-        out.push(objects[at..at + len].to_vec());
         at += len;
     }
     Ok(out)
 }
 
 /// Every index group of one block data file, in key order.
-fn read_groups(dir: &Path, file: &AreaFile) -> Result<Option<(Layout, Vec<Group>)>, ImportError> {
+fn read_groups(
+    dir: &Path,
+    file: &AreaFile,
+) -> Result<Option<(Layout, Vec<RawGroup>)>, ImportError> {
     let path = dir.join(file.name);
     let idx_path = dir.join(format!("{}.idx", file.name));
     let Some((layout, entries)) = read_index(&idx_path, file.key)? else {
@@ -465,9 +485,15 @@ fn read_groups(dir: &Path, file: &AreaFile) -> Result<Option<(Layout, Vec<Group>
                 .ok_or_else(|| {
                     layout_error(&path, format!("group key at byte {key_start} does not fit"))
                 })?;
-            groups.push(Group {
+            let objects = &logical[key_start + len..next];
+            // Checked for its own sake: the boundaries are recomputed when
+            // merging, but a payload that does not divide into whole
+            // records has to be refused here, where the file it came from
+            // can still be named.
+            split_objects(file, objects, &path)?;
+            groups.push(RawGroup {
                 key: logical[key_start..key_start + len].to_vec(),
-                objects: split_objects(file, &logical[key_start + len..next], &path)?,
+                objects: objects.to_vec(),
             });
             offset = next;
         }
@@ -502,53 +528,158 @@ fn read_groups(dir: &Path, file: &AreaFile) -> Result<Option<(Layout, Vec<Group>
 /// by id too (`Area_Skeleton::operator<`, `Area_Block::operator<`, and the
 /// bare ids in the tag files). A stable sort keeps several blocks of one
 /// area in the order the shard that built them wrote them.
-fn merge_objects(
+/// Feeds the objects of one key, taken from every shard that has it, into
+/// `packer` in order.
+///
+/// Every area record begins with its area's id as a u32, and the shards hold
+/// disjoint areas, so ordering by that id puts the objects back exactly
+/// where one unsharded run would have had them: upstream orders these files
+/// by id too (`Area_Skeleton::operator<`, `Area_Block::operator<`, and the
+/// bare ids in the tag files).
+///
+/// A k-way merge over the shards' buffers rather than a sort of everything:
+/// each shard's objects are already in id order, nothing is copied, and the
+/// objects reach the packer as slices of the bytes they were read as.
+fn merge_into(
     file: &AreaFile,
-    mut parts: Vec<Vec<Vec<u8>>>,
-) -> Result<Vec<Vec<u8>>, ImportError> {
-    if parts.len() == 1 {
-        return Ok(parts.pop().expect("just checked"));
-    }
-    let mut objects: Vec<Vec<u8>> = parts.concat();
-    objects.sort_by_key(|o| u32_at(o, 0).unwrap_or(0));
-    // Disjoint shards cannot both hold an area, but a bug in the shard
-    // selection could make them, and the result would be a database with
-    // every area twice. Catching it is cheap.
-    if file.name == "areas.bin" {
-        for pair in objects.windows(2) {
-            if u32_at(&pair[0], 0) == u32_at(&pair[1], 0) {
-                return Err(ImportError::Areas(AreaError::Duplicate {
-                    file: file.name,
-                    id: u32_at(&pair[0], 0).unwrap_or(0),
-                }));
-            }
+    parts: &[(&[u8], Vec<usize>)],
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), ImportError>,
+) -> Result<(), ImportError> {
+    // Where each shard has got to, and the id it is offering.
+    let mut at: Vec<usize> = vec![0; parts.len()];
+    let id_of = |part: usize, i: usize| -> u32 {
+        let (bytes, starts) = &parts[part];
+        u32_at(&bytes[starts[i]..], 0).unwrap_or(0)
+    };
+    let object = |part: usize, i: usize| -> &[u8] {
+        let (bytes, starts) = &parts[part];
+        let from = starts[i];
+        let to = starts.get(i + 1).copied().unwrap_or(bytes.len());
+        &bytes[from..to]
+    };
+
+    let mut previous: Option<u32> = None;
+    loop {
+        let next = (0..parts.len())
+            .filter(|&p| at[p] < parts[p].1.len())
+            .min_by_key(|&p| (id_of(p, at[p]), p));
+        let Some(p) = next else { break };
+        let id = id_of(p, at[p]);
+        // Disjoint shards cannot both hold an area. A bug in the shard
+        // selection could make them, and the result would be a database
+        // holding every area twice; catching it costs one comparison.
+        if file.one_object_per_area && previous == Some(id) {
+            return Err(ImportError::Areas(AreaError::Duplicate {
+                file: file.name,
+                id,
+            }));
         }
+        emit(object(p, at[p]))?;
+        previous = Some(id);
+        at[p] += 1;
     }
-    Ok(objects)
+    Ok(())
 }
 
-fn write_file(
-    out_dir: &Path,
+/// Blocks handed to the writer at once, as files.rs does it.
+const BATCH: usize = 32;
+
+/// Reads one file from every shard, merges it, and writes it.
+///
+/// One file at a time, and the packed blocks go to the writer as they are
+/// ready rather than piling up: what stays in memory is the shards' copies
+/// of this one file.
+fn merge_file(
+    shards: &[PathBuf],
+    out: &Path,
     file: &AreaFile,
-    layout: Layout,
-    groups: &[Group],
     threads: usize,
 ) -> Result<(), ImportError> {
-    let path = out_dir.join(file.name);
-    let blocks =
-        pack(groups, layout.block_size as u32).map_err(|e| layout_error(&path, e.to_string()))?;
-    let data = fs::File::create(&path).map_err(at(&path))?;
-    let mut block_file = BlockFile::new(
-        BufWriter::new(data),
+    let mut layout: Option<Layout> = None;
+    let mut read = Vec::new();
+    for shard in shards {
+        let Some((shard_layout, groups)) = read_groups(shard, file)? else {
+            continue;
+        };
+        match layout {
+            None => layout = Some(shard_layout),
+            Some(first) if first != shard_layout => {
+                return Err(ImportError::Areas(AreaError::Mismatch {
+                    file: file.name,
+                    left: first,
+                    right: shard_layout,
+                }))
+            }
+            Some(_) => {}
+        }
+        read.push(groups);
+    }
+    // No shard wrote this file, so there is nothing to merge; an unsharded
+    // run would not have left one either.
+    let Some(layout) = layout else {
+        return Ok(());
+    };
+
+    // Every shard's groups are already in key order, so the merged key
+    // order is a k-way merge of them -- no sorting, and each group's bytes
+    // are visited once.
+    let path = out.join(file.name);
+    let mut sink = BlockSink::create(
+        out,
+        file.name,
         layout.block_size as u32,
         layout.compression,
         threads,
-    );
-    block_file.append(&blocks).map_err(at(&path))?;
-    let (mut data, index) = block_file.finish().map_err(at(&path))?;
-    data.flush().map_err(at(&path))?;
-    let idx_path = out_dir.join(format!("{}.idx", file.name));
-    fs::write(&idx_path, &index).map_err(at(&idx_path))?;
+    )
+    .map_err(at(&path))?;
+    let mut packer = Packer::new(layout.block_size as u32);
+    let mut at_group: Vec<usize> = vec![0; read.len()];
+
+    loop {
+        let next = (0..read.len())
+            .filter(|&s| at_group[s] < read[s].len())
+            .min_by(|&a, &b| {
+                file.key
+                    .cmp(&read[a][at_group[a]].key, &read[b][at_group[b]].key)
+                    .then(a.cmp(&b))
+            });
+        let Some(first) = next else { break };
+        let key = read[first][at_group[first]].key.clone();
+
+        // Every shard holding this key contributes to one group.
+        let mut parts: Vec<(&[u8], Vec<usize>)> = Vec::new();
+        for s in 0..read.len() {
+            if at_group[s] < read[s].len()
+                && file.key.cmp(&read[s][at_group[s]].key, &key) == std::cmp::Ordering::Equal
+            {
+                let objects = read[s][at_group[s]].objects.as_slice();
+                parts.push((objects, split_objects(file, objects, &path)?));
+                at_group[s] += 1;
+            }
+        }
+
+        packer.begin(key);
+        merge_into(file, &parts, &mut |object| {
+            packer.object(object).map_err(|error| ImportError::Block {
+                file: file.name,
+                error,
+            })
+        })?;
+        packer.end().map_err(|error| ImportError::Block {
+            file: file.name,
+            error,
+        })?;
+        if packer.ready() >= BATCH {
+            sink.send(packer.blocks()).map_err(at(&path))?;
+        }
+    }
+
+    let last = packer.finish().map_err(|error| ImportError::Block {
+        file: file.name,
+        error,
+    })?;
+    sink.send(last).map_err(at(&path))?;
+    sink.finish().map_err(at(&path))?;
     Ok(())
 }
 
@@ -556,47 +687,7 @@ fn write_file(
 /// base data the shards were built from.
 pub fn merge(shards: &[PathBuf], out: &Path, threads: usize) -> Result<(), ImportError> {
     for file in &FILES {
-        let mut layout: Option<Layout> = None;
-        let mut by_key: Vec<(Vec<u8>, Parts)> = Vec::new();
-
-        for shard in shards {
-            let Some((shard_layout, groups)) = read_groups(shard, file)? else {
-                continue;
-            };
-            match layout {
-                None => layout = Some(shard_layout),
-                Some(first) if first != shard_layout => {
-                    return Err(ImportError::Areas(AreaError::Mismatch {
-                        file: file.name,
-                        left: first,
-                        right: shard_layout,
-                    }))
-                }
-                Some(_) => {}
-            }
-            for group in groups {
-                match by_key.binary_search_by(|(key, _)| file.key.cmp(key, &group.key)) {
-                    Ok(at) => by_key[at].1.push(group.objects),
-                    Err(at) => by_key.insert(at, (group.key, vec![group.objects])),
-                }
-            }
-        }
-
-        let Some(layout) = layout else {
-            // No shard wrote this file, so there is nothing to merge; the
-            // areas pass leaves none behind either.
-            continue;
-        };
-        let groups = by_key
-            .into_iter()
-            .map(|(key, parts)| {
-                Ok(Group {
-                    key,
-                    objects: merge_objects(file, parts)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ImportError>>()?;
-        write_file(out, file, layout, &groups, threads)?;
+        merge_file(shards, out, file, threads)?;
     }
 
     // The data version the areas were built against. Every shard read the
@@ -691,7 +782,7 @@ mod tests {
             area_block(5, &[]),
         ];
         let b = vec![area_block(2, &[20]), area_block(9, &[])];
-        let merged = merge_objects(file, vec![a, b]).unwrap();
+        let merged = merged_objects(file, &[&a, &b]).unwrap();
         let ids: Vec<u32> = merged.iter().map(|o| u32_at(o, 0).unwrap()).collect();
         assert_eq!(ids, vec![1, 1, 2, 5, 9]);
         // Area 1's two blocks keep the order its shard wrote them in.
@@ -704,11 +795,33 @@ mod tests {
         let file = &FILES[0];
         let a = vec![skeleton(1, &[]), skeleton(3, &[])];
         let b = vec![skeleton(3, &[])];
-        let err = merge_objects(file, vec![a, b]).unwrap_err();
+        let err = merged_objects(file, &[&a, &b]).unwrap_err();
         assert!(
             err.to_string().contains("area 3 is in more than one shard"),
             "{err}"
         );
+    }
+
+    /// Runs the k-way merge over shards given as lists of whole objects,
+    /// and collects what it emits.
+    fn merged_objects(
+        file: &AreaFile,
+        shards: &[&Vec<Vec<u8>>],
+    ) -> Result<Vec<Vec<u8>>, ImportError> {
+        let buffers: Vec<Vec<u8>> = shards.iter().map(|s| s.concat()).collect();
+        let parts: Vec<(&[u8], Vec<usize>)> = buffers
+            .iter()
+            .map(|b| {
+                let starts = split_objects(file, b, Path::new("test")).unwrap();
+                (b.as_slice(), starts)
+            })
+            .collect();
+        let mut out = Vec::new();
+        merge_into(file, &parts, &mut |o| {
+            out.push(o.to_vec());
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn local_key(index: u32, k: &str, v: &str) -> Vec<u8> {
@@ -783,6 +896,6 @@ mod tests {
     fn a_single_shard_is_passed_through_unchanged() {
         let file = &FILES[0];
         let only = vec![skeleton(7, &[1]), skeleton(8, &[])];
-        assert_eq!(merge_objects(file, vec![only.clone()]).unwrap(), only);
+        assert_eq!(merged_objects(file, &[&only]).unwrap(), only);
     }
 }
