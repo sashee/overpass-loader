@@ -166,6 +166,22 @@ impl Order {
         self.last = Some((kind, id));
         Ok(())
     }
+
+    /// Joins a run of elements whose order has already been checked among
+    /// themselves: checks only `first` against what came before, then takes
+    /// `last` as the most recent element.
+    ///
+    /// This is what lets the per-element check run on a decoding worker.
+    /// Checking a block's own elements needs nothing but the block, so a
+    /// worker does it with an `Order` of its own; all that is left for the
+    /// caller, which alone sees the blocks in file order, is the seam
+    /// between one block and the next. `check` on every element and `span`
+    /// per block reject exactly the same inputs.
+    pub fn span(&mut self, first: (Kind, u64), last: (Kind, u64)) -> Result<(), PbfError> {
+        self.check(first.0, first.1)?;
+        self.last = Some(last);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
