@@ -13,7 +13,7 @@ inputs; nothing outside this repository is needed.
 | package | what |
 |---|---|
 | `overpass-load` | `overpass-load FILE.osm.pbf DIR [options]`: the base data |
-| `overpass-areas` | `overpass-areas DIR [RULES]`: adds the areas to a database |
+| `overpass-areas` | `overpass-areas [--shards=N] DIR [RULES]`: adds the areas to a database |
 | `overpass-load-with-areas` (default) | `overpass-load-with-areas FILE.osm.pbf DIR [--rules=FILE] [options]`: both, a database ready to serve |
 | `overpass` | upstream, whole: `dispatcher`, `osm3s_query`, `update_database`, `cgi-bin/interpreter`, the scripts, templates and rules |
 | `overpass-import` | the importer itself, which `overpass-load` runs |
@@ -34,6 +34,12 @@ nix run .#overpass-load-with-areas -- france-260920.osm.pbf /srv/overpass/db --p
   without a dispatcher. `overpass-areas` fails if no areas result or if a
   dispatcher's files are present before or left behind after. Keeping it
   separate allows the import and the areas in separate derivations.
+- `--shards=N` (default: the number of cores) divides the areas pass between
+  N processes of `overpass-sharded` and merges what they build; the areas do
+  not depend on N, and `--shards=1` runs upstream's pass unmodified. The
+  shards work in a hidden directory inside `DIR`, which needs room for the
+  areas twice over until the end; the areas go into `DIR` only once the
+  whole pass has succeeded.
 - **Serve with the `overpass` of the same flake revision**: it is the build
   that made the areas and the one the importer is checked against, so the
   server reads what its own version wrote. Upstream at this pin calls
@@ -126,7 +132,8 @@ the following blocks, which carry the same key.
 | `import-<input>` | the importer's lz4 and uncompressed databases are equivalent to the references (for inputs with areas, after running upstream's areas pass on the importer's output), and with 64 KiB of memory it writes the same lz4 database |
 | `import-refusals` | the importer refuses (exit 1) every input it must refuse |
 | `import-crafted` | on PBF files no writer produces (other blob compressions, headers missing or repeated, granularity and offsets, mixed or empty groups, plain nodes, locations on ways, ids and order across blocks), the importer refuses what it must and otherwise writes the same database as for the plain encoding |
-| `scripts` | `overpass-load-with-areas` on Liechtenstein equals the reference with areas; the data version is the header's timestamp; the scripts refuse a non-empty directory, a missing database and missing arguments |
+| `scripts` | `overpass-load-with-areas` on Liechtenstein equals the reference with areas; the data version is the header's timestamp; the areas do not depend on `--shards`, including more shards than relations; a pass that fails or cannot write its areas fails and leaves the database as it was; the shards work inside the database, not in `TMPDIR`; the scripts refuse a non-empty directory, a missing database, missing arguments and a bad `--shards` |
+| `foreach-shard` | on Liechtenstein, the shards of the areas pass build every area exactly once between them, and merged they equal the unsharded reference by query and by bytes; a `foreach` nested in the sharded one runs whole; shards whose areas were written in many batches, as a large database writes them, merge to the same files |
 | `serve-liechtenstein` | end to end: what `overpass-load-with-areas` writes for Liechtenstein, served as in production (lighttpd running `cgi-bin/interpreter`, dispatchers for the base data and the areas), answers queries over HTTP (bounding boxes, tags, recursion, areas) as the reference served the same way does, and reports the header's timestamp for the base data and the areas |
 | `corpus-<input>` | the input's references show what the input is meant to exercise (below) |
 | `encoding-<input>` | other PBF encodings of the same data give an equivalent database, through upstream and through the importer; the importer also reads osmium's locations on ways and PBF as osmconvert writes it |

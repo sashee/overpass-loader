@@ -7,18 +7,23 @@
 {
   writeShellApplication,
   coreutils,
+  gnugrep,
   overpass,
   overpass-import,
 
   # Upstream plus the patch that makes `loop_over_elements` take every nth
-  # element, so n processes can divide one area pass between them.
+  # element, so n processes can divide one area pass between them; and a
+  # knob for tests that the script leaves alone (see nix/shard-check.nix).
   #
   # Derived from `overpass` rather than taken as a package so it always
   # matches it: a caller that overrides `overpass` with its own build -- which
   # is the point of that argument, so the server reads what its own version
   # wrote -- gets a sharded build of that same thing, not of some other one.
   overpass-sharded ? overpass.override {
-    patches = [ ./patches/foreach-shard.patch ];
+    patches = [
+      ./patches/foreach-shard.patch
+      ./patches/area-commit-blocks.patch
+    ];
     variant = "sharded";
   },
 }:
@@ -64,6 +69,7 @@ rec {
       overpass
       overpass-import
       coreutils
+      gnugrep
     ];
     text = ''
       shards=$(nproc)
@@ -109,51 +115,74 @@ rec {
       # area pass reporting a database file that plainly exists as missing.
       dir=$(realpath "$dir")
 
+      # Every shard -- a single one too -- builds its areas in a database of
+      # its own, and they go into DIR only once the whole pass has succeeded:
+      # a pass that fails leaves DIR as it was. The shard databases read the
+      # base through symlinks, so nothing copies it, which at planet scale
+      # would be hundreds of gigabytes per shard. They are inside DIR, hidden
+      # from the glob that makes the links, because between them they hold
+      # all the areas until the merge -- gigabytes for the planet, more than
+      # a small or memory-backed TMPDIR takes -- and so that moving the
+      # result in is a rename.
+      work=$(mktemp -d "$dir/.overpass-areas.XXXXXX")
+      # shellcheck disable=SC2064
+      trap "rm -rf '$work'" EXIT
+
+      for i in $(seq 0 $((shards - 1))); do
+        mkdir -p "$work/shard$i"
+        for f in "$dir"/*; do
+          case $(basename "$f") in
+            area*) continue ;;
+          esac
+          ln -s "$f" "$work/shard$i/$(basename "$f")"
+        done
+      done
+
+      # One shard runs upstream's pass unmodified; more need the patch. The
+      # result document is empty; errors and progress go to the shard's log.
+      query=${overpass}/bin/osm3s_query
+      [ "$shards" -eq 1 ] || query=${overpass-sharded}/bin/osm3s_query
+      for i in $(seq 0 $((shards - 1))); do
+        (
+          # `|| rc=$?` rather than `$?` afterwards: errexit would end the
+          # subshell at the failure, before it could write down the status.
+          rc=0
+          OVERPASS_FOREACH_SHARD="$i/$shards" "$query" --progress --rules \
+            --db-dir="$work/shard$i/" \
+            < "$rules" > /dev/null 2> "$work/shard$i.log" || rc=$?
+          echo "$rc" > "$work/shard$i.rc"
+        ) &
+      done
+      wait
+
+      # A shard that died leaves its areas out, and the result would look
+      # like a smaller world rather than like a failure. So does one that
+      # could not write them: upstream reports that as a File_Error at the
+      # end of the pass, and exits 0 regardless.
+      for i in $(seq 0 $((shards - 1))); do
+        rc=$(cat "$work/shard$i.rc" 2>/dev/null || echo missing)
+        if [ "$rc" != 0 ]; then
+          echo "shard $i of $shards exited $rc:" >&2
+          tail -20 "$work/shard$i.log" >&2 || true
+          exit 1
+        fi
+        if grep -q File_Error "$work/shard$i.log"; then
+          echo "shard $i of $shards could not write its areas:" >&2
+          grep -m 5 File_Error "$work/shard$i.log" >&2
+          exit 1
+        fi
+      done
+
+      made=false
+      for i in $(seq 0 $((shards - 1))); do
+        [ ! -s "$work/shard$i/areas.bin" ] || made=true
+      done
+      [ "$made" = true ] || fail "the areas pass made no areas"
+
       if [ "$shards" -eq 1 ]; then
-        # Without a dispatcher: --db-dir writes to the database directly. The
-        # result document is empty; errors and progress go to stderr.
-        osm3s_query --progress --rules --db-dir="$dir/" < "$rules" > /dev/null
+        # Upstream's files as they are.
+        mv "$work/shard0"/area* "$dir/"
       else
-        # Each shard needs a database of its own to write areas into, but they
-        # all read the same base -- so the shard directories are symlinks to
-        # it. Nothing copies the base, which at planet scale would be hundreds
-        # of gigabytes per shard.
-        work=$(mktemp -d)
-        # shellcheck disable=SC2064
-        trap "rm -rf '$work'" EXIT
-
-        for i in $(seq 0 $((shards - 1))); do
-          mkdir -p "$work/shard$i"
-          for f in "$dir"/*; do
-            case $(basename "$f") in
-              area*) continue ;;
-            esac
-            ln -s "$f" "$work/shard$i/$(basename "$f")"
-          done
-        done
-
-        for i in $(seq 0 $((shards - 1))); do
-          (
-            OVERPASS_FOREACH_SHARD="$i/$shards" \
-              ${overpass-sharded}/bin/osm3s_query --progress --rules \
-              --db-dir="$work/shard$i/" \
-              < "$rules" > /dev/null 2> "$work/shard$i.log"
-            echo "$?" > "$work/shard$i.rc"
-          ) &
-        done
-        wait
-
-        # A shard that died leaves its areas out of the merge, and the result
-        # would look like a smaller world rather than like a failure.
-        for i in $(seq 0 $((shards - 1))); do
-          rc=$(cat "$work/shard$i.rc" 2>/dev/null || echo missing)
-          if [ "$rc" != 0 ]; then
-            echo "shard $i of $shards exited $rc:" >&2
-            tail -20 "$work/shard$i.log" >&2 || true
-            exit 1
-          fi
-        done
-
         shard_dirs=()
         for i in $(seq 0 $((shards - 1))); do
           shard_dirs+=("$work/shard$i")
@@ -161,7 +190,6 @@ rec {
         overpass-merge-areas "$dir" "''${shard_dirs[@]}"
       fi
 
-      [ -s "$dir/areas.bin" ] || fail "the areas pass made no areas"
       for f in osm3s_osm_base osm3s_areas transactions.log database.log; do
         [ ! -e "$dir/$f" ] || fail "the areas pass left $dir/$f behind"
       done

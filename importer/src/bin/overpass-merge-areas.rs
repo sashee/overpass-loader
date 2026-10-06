@@ -16,7 +16,8 @@ base data the shards were built from and no area files of its own.
 
 Every shard must have been built from that same base data, by
 `osm3s_query --rules` with a different $OVERPASS_FOREACH_SHARD, so that
-together they hold each area exactly once.
+together they hold each area exactly once. A shard that built no areas has
+no area files, and adds nothing.
 
   --threads N   threads for compressing the merged files (default: all cores)
 
@@ -31,10 +32,10 @@ const AREA_FILES: [&str; 5] = [
     "area_version",
 ];
 
-fn run() -> Result<(), (u8, String)> {
+fn run(args: impl IntoIterator<Item = String>) -> Result<(), (u8, String)> {
     let mut threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut positional: Vec<PathBuf> = Vec::new();
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         if let Some(v) = arg.strip_prefix("--threads=") {
             threads = v
                 .parse()
@@ -82,9 +83,19 @@ fn run() -> Result<(), (u8, String)> {
             ),
         ));
     }
+    // Upstream writes area_version whenever an areas pass runs, but the area
+    // files only if it has areas to put in them -- and with more shards than
+    // areas, some have none. So a shard without area files built nothing,
+    // while one without area_version is not an areas pass's output at all.
     for shard in shards {
-        if !shard.join("areas.bin").exists() {
-            return Err((1, format!("{} has no areas.bin", shard.display())));
+        if !shard.join("area_version").exists() {
+            return Err((
+                1,
+                format!(
+                    "{} has no area_version: no areas pass ran there",
+                    shard.display()
+                ),
+            ));
         }
     }
 
@@ -95,7 +106,7 @@ fn run() -> Result<(), (u8, String)> {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    match run(std::env::args().skip(1)) {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, message)) => {
             eprint!(
@@ -104,5 +115,96 @@ fn main() -> ExitCode {
             );
             ExitCode::from(code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A fresh directory for one test, holding `files` (empty).
+    fn dir(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "overpass-merge-areas-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            fs::write(dir.join(file), "").unwrap();
+        }
+        dir
+    }
+
+    /// A shard whose areas pass ran on data of `version` and built nothing.
+    fn empty_shard(name: &str, version: &str) -> PathBuf {
+        let shard = dir(name, &[]);
+        fs::write(shard.join("area_version"), version).unwrap();
+        shard
+    }
+
+    /// The exit status `run` gives `args`.
+    fn status(args: &[&PathBuf]) -> u8 {
+        let args = args.iter().map(|p| p.to_string_lossy().into_owned());
+        run(args).err().map_or(0, |(code, _)| code)
+    }
+
+    #[test]
+    fn usage_errors_exit_2() {
+        let words = |args: &[&str]| run(args.iter().map(|a| a.to_string())).unwrap_err().0;
+        assert_eq!(words(&[]), 2);
+        assert_eq!(words(&["db"]), 2, "no shards");
+        assert_eq!(words(&["--threads=0", "db", "shard"]), 2);
+        assert_eq!(words(&["--frobnicate", "db", "shard"]), 2);
+    }
+
+    /// Merging over existing area files would leave some areas twice.
+    #[test]
+    fn a_database_that_already_has_area_files_is_refused() {
+        let shard = empty_shard("existing-shard", "v\n");
+        for existing in ["areas.bin", "area_blocks.bin.idx", "area_version"] {
+            let out = dir(&format!("existing-{existing}"), &["nodes.bin", existing]);
+            assert_eq!(status(&[&out, &shard]), 1, "{existing}");
+        }
+    }
+
+    #[test]
+    fn a_database_without_base_data_is_refused() {
+        let out = dir("no-base", &[]);
+        let shard = empty_shard("no-base-shard", "v\n");
+        assert_eq!(status(&[&out, &shard]), 1);
+    }
+
+    /// A directory the areas pass never ran in, such as a mistyped one,
+    /// is not a shard that built nothing.
+    #[test]
+    fn a_shard_without_area_version_is_refused() {
+        let out = dir("not-a-shard", &["nodes.bin"]);
+        let shard = empty_shard("not-a-shard-ok", "v\n");
+        let other = dir("not-a-shard-other", &[]);
+        assert_eq!(status(&[&out, &shard, &other]), 1);
+        assert!(!out.join("area_version").exists());
+    }
+
+    /// More shards than areas leaves shards with no area files at all.
+    #[test]
+    fn shards_that_built_nothing_are_accepted() {
+        let out = dir("built-nothing", &["nodes.bin"]);
+        let a = empty_shard("built-nothing-a", "2026-09-20T20:21:22Z\n");
+        let b = empty_shard("built-nothing-b", "2026-09-20T20:21:22Z\n");
+        assert_eq!(status(&[&out, &a, &b]), 0);
+        assert_eq!(
+            fs::read_to_string(out.join("area_version")).unwrap(),
+            "2026-09-20T20:21:22Z\n"
+        );
+    }
+
+    #[test]
+    fn shards_built_from_different_data_are_refused() {
+        let out = dir("versions", &["nodes.bin"]);
+        let a = empty_shard("versions-a", "2026-09-20T20:21:22Z\n");
+        let b = empty_shard("versions-b", "2026-09-27T20:21:22Z\n");
+        assert_eq!(status(&[&out, &a, &b]), 1);
     }
 }

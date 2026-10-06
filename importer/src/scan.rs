@@ -47,8 +47,10 @@ pub struct Scan {
     pub way_members: Sorter,
 }
 
-/// A block's first and last element, each as a kind and an id.
-type Ends = ((Kind, u64), (Kind, u64));
+/// A block's first element, and its last once its own elements have been
+/// checked against each other -- or why they were refused. Each element as
+/// a kind and an id.
+type Ends = ((Kind, u64), Result<(Kind, u64), PbfError>);
 
 /// A block as a decoding worker prepares it: where its nodes are stored,
 /// their records for the node files, and the block's own element order.
@@ -57,10 +59,8 @@ struct Prepared {
     places: Vec<(u32, u32)>,
     skeletons: Batch,
     tags: TagBatch,
-    /// The block's first and last element, once its own elements have been
-    /// checked against each other, or why they were refused. `None` for an
-    /// empty block.
-    span: Result<Option<Ends>, PbfError>,
+    /// The block's ends; `None` for an empty block.
+    span: Option<Ends>,
 }
 
 fn prepare(block: Block) -> Prepared {
@@ -87,21 +87,24 @@ fn prepare(block: Block) -> Prepared {
 /// Checks the order of a block's own elements and returns its first and
 /// last. Runs on a decoding worker: it needs only the block, so the
 /// consumer is left with one check per block instead of one per element.
-fn block_span(block: &Block) -> Result<Option<Ends>, PbfError> {
+///
+/// The first element comes back even when the block is refused: the seam
+/// with the previous block is checked before the block's own verdict, as it
+/// would be element by element.
+fn block_span(block: &Block) -> Option<Ends> {
+    let mut elements = block.sequence().map(|(kind, i)| match kind {
+        Kind::Node => (kind, block.nodes[i].id),
+        Kind::Way => (kind, u64::from(block.ways[i].id)),
+        Kind::Relation => (kind, u64::from(block.relations[i].id)),
+    });
+    let first = elements.next()?;
     let mut order = Order::default();
-    let mut first = None;
-    let mut last = None;
-    for (kind, i) in block.sequence() {
-        let id = match kind {
-            Kind::Node => block.nodes[i].id,
-            Kind::Way => u64::from(block.ways[i].id),
-            Kind::Relation => u64::from(block.relations[i].id),
-        };
-        order.check(kind, id)?;
-        first.get_or_insert((kind, id));
-        last = Some((kind, id));
-    }
-    Ok(first.zip(last))
+    let last = std::iter::once(first)
+        .chain(elements)
+        .try_fold(first, |_, (kind, id)| {
+            order.check(kind, id).map(|()| (kind, id))
+        });
+    Some((first, last))
 }
 
 /// The offsets into a run of `len` nodes that start a bucket, given how
@@ -185,7 +188,7 @@ impl Scanner<'_> {
         }
         // The worker checked the block's elements against each other; only
         // the seam with the previous block is left.
-        if let Some((first, last)) = span? {
+        if let Some((first, last)) = span {
             self.order.span(first, last)?;
         }
         self.nodes(&block, &places)?;
@@ -439,22 +442,32 @@ mod tests {
     fn block_span_reports_the_ends_and_refuses_disorder_within_a_block() {
         let b = block_of(&[1, 4, 9], &[2, 3], &[7]);
         assert_eq!(
-            block_span(&b).unwrap(),
-            Some(((Kind::Node, 1), (Kind::Relation, 7)))
+            block_span(&b),
+            Some(((Kind::Node, 1), Ok((Kind::Relation, 7))))
         );
-        assert_eq!(block_span(&block_of(&[], &[], &[])).unwrap(), None);
+        assert_eq!(block_span(&block_of(&[], &[], &[])), None);
         assert_eq!(
-            block_span(&block_of(&[5], &[], &[])).unwrap(),
-            Some(((Kind::Node, 5), (Kind::Node, 5)))
+            block_span(&block_of(&[5], &[], &[])),
+            Some(((Kind::Node, 5), Ok((Kind::Node, 5))))
         );
 
+        // A refused block still reports its first element, for the seam.
         let message = |b: Block| match block_span(&b) {
-            Err(PbfError::Order(m)) => m,
+            Some((first, Err(PbfError::Order(m)))) => (first, m),
             other => panic!("{other:?}"),
         };
-        assert_eq!(message(block_of(&[5, 2], &[], &[])), "node 2 after node 5");
-        assert_eq!(message(block_of(&[5, 5], &[], &[])), "node 5 appears twice");
-        assert_eq!(message(block_of(&[], &[3, 1], &[])), "way 1 after way 3");
+        assert_eq!(
+            message(block_of(&[5, 2], &[], &[])),
+            ((Kind::Node, 5), "node 2 after node 5".into())
+        );
+        assert_eq!(
+            message(block_of(&[5, 5], &[], &[])),
+            ((Kind::Node, 5), "node 5 appears twice".into())
+        );
+        assert_eq!(
+            message(block_of(&[], &[3, 1], &[])),
+            ((Kind::Way, 3), "way 1 after way 3".into())
+        );
     }
 
     /// The whole point of `span`: checking each block's own elements on a
@@ -476,6 +489,11 @@ mod tests {
                 block_of(&[], &[], &[]),
                 block_of(&[1], &[], &[]),
             ],
+            // Out of order both at the seam and inside the block: checking
+            // element by element meets the seam first, so that is the
+            // message, not the block's own.
+            vec![block_of(&[1, 5], &[], &[]), block_of(&[3, 2], &[], &[])],
+            vec![block_of(&[], &[2], &[]), block_of(&[1, 1], &[], &[])],
         ];
         for blocks in runs {
             let mut per_element = Order::default();
@@ -489,7 +507,7 @@ mod tests {
             let expected = flat.try_for_each(|(k, id)| per_element.check(k, id));
 
             let mut per_block = Order::default();
-            let actual = blocks.iter().try_for_each(|b| match block_span(b)? {
+            let actual = blocks.iter().try_for_each(|b| match block_span(b) {
                 Some((first, last)) => per_block.span(first, last),
                 None => Ok(()),
             });

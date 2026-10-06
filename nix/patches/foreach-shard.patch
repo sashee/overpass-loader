@@ -1,17 +1,21 @@
 diff --git a/overpass_api/statements/foreach.cc b/overpass_api/statements/foreach.cc
 --- a/overpass_api/statements/foreach.cc
 +++ b/overpass_api/statements/foreach.cc
-@@ -79,16 +79,65 @@
+@@ -79,9 +79,65 @@
  { target.deriveds[idx].push_back(skel); }
  
  
 +// Shard selection for running one foreach as several processes.
 +//
 +// $OVERPASS_FOREACH_SHARD="i/n" makes this process execute only every n-th
-+// iteration of every foreach, starting at i. The iterations of a foreach are
-+// independent of each other -- each one gets its own Set and the
++// iteration of every outermost foreach, starting at i. The iterations of a
++// foreach are independent of each other -- each one gets its own Set and the
 +// substatements see nothing of the previous pass -- so the n shards together
 +// perform exactly the iterations one unsharded run would, each exactly once.
++//
++// Only one level of a nest of loops may be divided this way: a foreach
++// inside the one a shard divides runs whole, or each shard would do only
++// 1/n of the work below the iterations it took.
 +//
 +// Taken from the environment rather than added as a statement attribute so
 +// that every shard runs a byte-identical query: the input that decides which
@@ -44,19 +48,27 @@ diff --git a/overpass_api/statements/foreach.cc b/overpass_api/statements/foreac
 +}
 +
 +
++// How many foreach statements are executing, each inside the one before.
++// Statements execute on one thread.
++static unsigned int foreach_depth = 0;
++
++struct Foreach_Depth
++{
++  Foreach_Depth() { ++foreach_depth; }
++  ~Foreach_Depth() { --foreach_depth; }
++  bool outermost() const { return foreach_depth == 1; }
++};
++
++
  template< typename Index, typename Object >
  void loop_over_elements(const std::map< Index, std::vector< Object > >& source, Resource_Manager& rman,
 -    std::vector< Statement* >& substatements, const std::string& input, const std::string& result_name)
 +    std::vector< Statement* >& substatements, const std::string& input, const std::string& result_name,
-+    unsigned long long& seq)
++    unsigned long long shard, unsigned long long shards, unsigned long long& seq)
  {
-+  unsigned long long shard = 0;
-+  unsigned long long shards = 1;
-+  foreach_shard(shard, shards);
-+
    for (typename std::map< Index, std::vector< Object > >::const_iterator
        it = source.begin(); it != source.end(); ++it)
-   {
+@@ -89,6 +145,11 @@
      for (typename std::vector< Object >::const_iterator it2 = it->second.begin();
          it2 != it->second.end(); ++it2)
      {
@@ -68,7 +80,7 @@ diff --git a/overpass_api/statements/foreach.cc b/overpass_api/statements/foreac
        rman.count_loop();
        Set empty;
        add_to_set(empty, it->first, *it2);
-@@ -113,14 +162,17 @@
+@@ -113,14 +174,23 @@
    if (!base_set)
      base_set = &base_result_set;
  
@@ -80,17 +92,23 @@ diff --git a/overpass_api/statements/foreach.cc b/overpass_api/statements/foreac
 -  loop_over_elements(base_set->attic_relations, rman, substatements, input, get_result_name());
 -  loop_over_elements(base_set->areas, rman, substatements, input, get_result_name());
 -  loop_over_elements(base_set->deriveds, rman, substatements, input, get_result_name());
++  Foreach_Depth depth;
++  unsigned long long shard = 0;
++  unsigned long long shards = 1;
++  if (depth.outermost())
++    foreach_shard(shard, shards);
++
 +  // One sequence across every element type, so a shard's share is defined by
 +  // position in the whole foreach rather than within one type.
 +  unsigned long long seq = 0;
-+  loop_over_elements(base_set->nodes, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->attic_nodes, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->ways, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->attic_ways, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->relations, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->attic_relations, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->areas, rman, substatements, input, get_result_name(), seq);
-+  loop_over_elements(base_set->deriveds, rman, substatements, input, get_result_name(), seq);
++  loop_over_elements(base_set->nodes, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->attic_nodes, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->ways, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->attic_ways, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->relations, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->attic_relations, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->areas, rman, substatements, input, get_result_name(), shard, shards, seq);
++  loop_over_elements(base_set->deriveds, rman, substatements, input, get_result_name(), shard, shards, seq);
  
    rman.move_all_inward_except(get_result_name());
    rman.pop_stack_frame();

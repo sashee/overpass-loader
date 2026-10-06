@@ -39,9 +39,13 @@
           #
           # A separate package rather than a patch on `overpass`: the server
           # must keep running stock upstream, and nothing but the area build
-          # has any use for this.
+          # has any use for this. Also $OVERPASS_AREA_COMMIT_BLOCKS, for
+          # tests only: see nix/shard-check.nix.
           overpass-sharded = overpass.override {
-            patches = [ ./nix/patches/foreach-shard.patch ];
+            patches = [
+              ./nix/patches/foreach-shard.patch
+              ./nix/patches/area-commit-blocks.patch
+            ];
             variant = "sharded";
           };
           # Upstream plus the fix that zeroes block padding, which makes
@@ -109,7 +113,12 @@
         // (corpusFor pkgs).checks
         // {
           foreach-shard = pkgs.callPackage ./nix/shard-check.nix {
-            inherit (packagesFor pkgs) overpass overpass-sharded overpass-import;
+            inherit (packagesFor pkgs)
+              overpass
+              overpass-sharded
+              overpass-import
+              overpass-cmp
+              ;
             # Base data only: the check runs the areas pass itself, both ways.
             base = (mkDbFor pkgs) {
               name = "liechtenstein";

@@ -1,0 +1,48 @@
+diff --git a/overpass_api/osm-backend/area_updater.h b/overpass_api/osm-backend/area_updater.h
+--- a/overpass_api/osm-backend/area_updater.h
++++ b/overpass_api/osm-backend/area_updater.h
+@@ -20,6 +20,7 @@
+ #define DE__OSM3S___OVERPASS_API__OSM_BACKEND__AREA_UPDATER_H
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <iostream>
+ #include <map>
+ #include <set>
+@@ -94,9 +95,35 @@
+ 
+ /** Implementation (inline functions): --------------------------------------*/
+ 
++// How many area blocks are gathered before they are written: 512 Ki, or
++// $OVERPASS_AREA_COMMIT_BLOCKS. For tests: with 0 every area is written as a
++// batch of its own, so a small database's area files are written the way a
++// planet's are, in many batches each updating what the ones before wrote.
++inline unsigned long area_commit_blocks()
++{
++  static unsigned long blocks = 512*1024;
++  static bool parsed = false;
++  if (!parsed)
++  {
++    parsed = true;
++    const char* spec = getenv("OVERPASS_AREA_COMMIT_BLOCKS");
++    if (spec && *spec)
++    {
++      char* end = 0;
++      blocks = strtoul(spec, &end, 10);
++      if (*end)
++      {
++        std::cerr<<"OVERPASS_AREA_COMMIT_BLOCKS must be a number, not \""<<spec<<"\"\n";
++        exit(1);
++      }
++    }
++  }
++  return blocks;
++}
++
+ inline void Area_Updater::commit()
+ {
+-  if (total_area_blocks_count > 512*1024)
++  if (total_area_blocks_count > area_commit_blocks())
+     update();
+ }
+ 

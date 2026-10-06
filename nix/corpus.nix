@@ -498,10 +498,83 @@ let
         expected=$(osmium fileinfo -g header.option.osmosis_replication_timestamp $pbf)
         echo "osm_base_version: $(cat base/osm_base_version), header: $expected"
         [ "$(cat base/osm_base_version)" = "$expected" ]
+        cp -r base base-1
+        cp -r base base-3
 
         echo "== overpass-areas adds the areas, and they carry the data version"
         overpass-areas base
         [ "$(cat base/area_version)" = "$expected" ]
+
+        echo "== the areas do not depend on how many shards build them"
+        # The default is a shard per core, which depends on the builder, so
+        # both ways are run explicitly: one shard is upstream's pass as it
+        # is, three are the sharded pass and the merge.
+        overpass-areas --shards=1 base-1
+        overpass-areas --shards=3 base-3
+        overpass-cmp base base-1
+        overpass-cmp base base-3
+
+        # A database small enough to run more shards than it has relations,
+        # without areas: the reference's base files.
+        cp -r --no-preserve=mode ${references.areas.lz4} small
+        rm small/area*
+        cp -r small small-unreadable
+        cp -r small small-refused
+        cp -r small small-no-tmp
+        cp -r small small-full-1
+        cp -r small small-full-2
+        # Whether a failed pass left anything in a database: area files, or
+        # the hidden work directories the pass and the merge write in.
+        leftovers() { ls -A "$1" | grep -e '^area' -e '^\.' || true; }
+
+        echo "== more shards than relations: some shards build nothing"
+        # Every iteration of the areas pass is a relation, so with one shard
+        # more than there are relations at least one shard has none. Upstream
+        # writes no area files then, which the merge must take as nothing to
+        # add rather than as a shard that went wrong.
+        relations=$(osmium fileinfo -e -g data.count.relations ${inputs.areas})
+        overpass-areas --shards=$((relations + 1)) small
+        overpass-cmp small ${references.areas.lz4}
+
+        echo "== a shard that fails fails the pass, says how, and changes nothing"
+        # The shards read the base through links, so an unreadable base file
+        # fails every one of them: osm3s_query exits 1.
+        chmod 000 small-unreadable/relations.bin
+        [ ! -r small-unreadable/relations.bin ] \
+          || { echo "FAIL: the file is still readable (root?), so this proves nothing"; exit 1; }
+        if overpass-areas --shards=2 small-unreadable 2> err; then
+          echo "FAIL: the pass succeeded on an unreadable base"
+          exit 1
+        fi
+        # The status itself, not "missing": that is what a shard that died
+        # without recording one would show.
+        grep -q "of 2 exited [1-9]" err || { echo "FAIL: no exit status reported:"; cat err; exit 1; }
+        [ -z "$(leftovers small-unreadable)" ] \
+          || { echo "FAIL: the failed pass left in the database: $(leftovers small-unreadable)"; exit 1; }
+
+        echo "== a pass that cannot write its areas fails, and changes nothing"
+        # Upstream reports an error writing the areas at the end of the pass,
+        # and exits 0 regardless. A file size limit makes those writes fail
+        # as a full disk would -- area files take at least 256 KiB, the logs
+        # far less -- and with SIGXFSZ ignored they fail rather than kill.
+        for shards in 1 2; do
+          if (trap "" XFSZ; ulimit -f 128; overpass-areas --shards=$shards small-full-$shards) 2> err; then
+            echo "FAIL: --shards=$shards succeeded though its areas could not be written"
+            exit 1
+          fi
+          grep -q File_Error err || { echo "FAIL: --shards=$shards did not say why:"; cat err; exit 1; }
+          [ -z "$(leftovers small-full-$shards)" ] \
+            || { echo "FAIL: --shards=$shards left in the database: $(leftovers small-full-$shards)"; exit 1; }
+        done
+
+        echo "== the shards work beside the database, not in TMPDIR"
+        # Before the merge the shards hold all the areas between them --
+        # gigabytes for the planet -- which a small or memory-backed TMPDIR
+        # cannot take.
+        TMPDIR=/nonexistent overpass-areas --shards=2 small-no-tmp
+        overpass-cmp small-no-tmp ${references.areas.lz4}
+        [ -z "$(leftovers small-no-tmp | grep '^\.' || true)" ] \
+          || { echo "FAIL: the pass left its work in the database"; exit 1; }
 
         echo "== refusals"
         refused() {
@@ -515,6 +588,13 @@ let
         mkdir empty
         refused overpass-areas empty
         refused overpass-load-with-areas $pbf
+        for shards in 0 -1 x ""; do
+          refused overpass-areas --shards="$shards" small-refused
+        done
+        if ls small-refused | grep -q '^area'; then
+          echo "FAIL: a refused --shards still ran the pass"
+          exit 1
+        fi
         touch $out
       '';
 
